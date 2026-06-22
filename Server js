@@ -1,0 +1,78 @@
+const express = require('express');
+const http = require('http');
+const { Pool } = require('pg');
+
+const app = express();
+app.use(express.json());
+
+// Establish secure pool connection to your cloud database
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+const server = http.createServer(app);
+
+// 1. VIVY HEALTH PORTAL
+app.get('/health', async (req, res) => {
+  try {
+    const dbTest = await pool.query('SELECT NOW()');
+    res.json({ status: "Vivy Core Engine Online!", dbTime: dbTest.rows[0].now });
+  } catch (err) {
+    res.status(500).json({ status: "Database connection failed", error: err.message });
+  }
+});
+
+// 2. CREATING A TEST INSTANCE PROFILER
+app.post('/test-setup', async (req, res) => {
+  const { username, email, role } = req.body;
+  try {
+    const newUser = await pool.query(
+      'INSERT INTO users (username, email, role, coin_balance) VALUES ($1, $2, $3, 100) RETURNING *',
+      [username, email, role]
+    );
+    if (role === 'host') {
+      await pool.query(
+        'INSERT INTO host_profiles (host_id, cost_per_30_seconds) VALUES ($1, 25)',
+        [newUser.rows[0].id]
+      );
+    }
+    res.json({ message: "Vivy test account created!", user: newUser.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. VIVY 30-SECOND RECURRING WALLET EXTRACER
+app.post('/simulate-call', async (req, res) => {
+  const { userId, hostId } = req.body;
+  res.json({ message: "Vivy call streaming links active. Withdrawing balances every 30s." });
+
+  let callTimer = setInterval(async () => {
+    try {
+      const userRes = await pool.query('SELECT coin_balance FROM users WHERE id = $1', [userId]);
+      const hostRes = await pool.query('SELECT cost_per_30_seconds FROM host_profiles WHERE host_id = $1', [hostId]);
+      
+      const currentCoins = userRes.rows[0].coin_balance;
+      const rate = hostRes.rows[0].cost_per_30_seconds;
+
+      if (currentCoins < rate) {
+        console.log(`[VIVY SYSTEM] User balance reached limit. Connection closed.`);
+        clearInterval(callTimer);
+        return;
+      }
+
+      // Live synchronized database swap
+      await pool.query('UPDATE users SET coin_balance = coin_balance - $1 WHERE id = $2', [rate, userId]);
+      await pool.query('UPDATE users SET coin_balance = coin_balance + $1 WHERE id = $2', [rate, hostId]);
+      
+      console.log(`[VIVY 30s TICK] Moved ${rate} coins. Remaining User Balance: ${currentCoins - rate}`);
+    } catch (err) {
+      console.log("Billing system loop break error:", err.message);
+      clearInterval(callTimer);
+    }
+  }, 30000); // 30 seconds execution window
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Vivy cloud engine running live on port ${PORT}`));
