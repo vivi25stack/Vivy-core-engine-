@@ -16,22 +16,101 @@ const COIN_TO_USD_VALUE = 0.001;
 const DEDUCTION_PER_30_SECONDS = 250; 
 
 // ==========================================
-// 1. ENDPOINTS
+// 1. VISUAL SIGNUP SCREENS (GET ROUTES)
 // ==========================================
-app.post('/api/register/host', async (req, res) => {
-  const { username, email, inviteCode } = req.body;
-  if (!username || !email || !inviteCode) return res.status(400).json({ error: "Missing fields." });
-  try {
-    const agency = await sql`SELECT id FROM agencies WHERE invite_code = ${inviteCode} AND is_approved = TRUE`;
-    if (!agency[0]) return res.status(400).json({ error: "Invalid or unapproved agency code." });
-    const userResult = await sql`INSERT INTO users (username, email, role, is_approved) VALUES (${username}, ${email}, 'host', FALSE) RETURNING id`;
-    await sql`INSERT INTO host_profiles (host_id, agency_id, earned_coins_balance, is_agency_locked) VALUES (${userResult[0].id}, ${agency[0].id}, 0, TRUE)`;
-    return res.json({ message: "Registered! Awaiting Admin Approval." });
-  } catch (err) { return res.status(500).json({ error: err.message }); }
+
+// Host Onboarding Form Layout
+app.get('/api/register/host', (req, res) => {
+  const inviteCode = req.query.code || '';
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Vivy Host Onboarding</title>
+      <style>
+        body { font-family: -apple-system, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; text-align: center; }
+        .form-card { background: #1e293b; padding: 20px; border-radius: 8px; max-width: 400px; margin: 40px auto; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        h1 { color: #f472b6; font-size: 20px; margin-bottom: 20px; }
+        input { width: 100%; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #334155; background: #0f172a; color: white; box-sizing: border-box; }
+        button { width: 100%; background: #3b82f6; color: white; border: none; padding: 12px; border-radius: 4px; font-weight: bold; cursor: pointer; margin-top: 10px; }
+      </style>
+    </head>
+    <body>
+      <div class="form-card">
+        <h1>🎙️ Join Vivy Host Network</h1>
+        <form action="/api/register/host" method="POST">
+          <input type="text" name="username" placeholder="Choose Host Stage Name" required>
+          <input type="email" name="email" placeholder="Your Email Address" required>
+          <input type="text" name="inviteCode" placeholder="Agency Invitation Code" value="${inviteCode}" required>
+          <button type="submit">Submit Registration</button>
+        </form>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+// Agency Onboarding Form Layout
+app.get('/api/register/agency', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Vivy Agency Registration</title>
+      <style>
+        body { font-family: -apple-system, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; text-align: center; }
+        .form-card { background: #1e293b; padding: 20px; border-radius: 8px; max-width: 400px; margin: 40px auto; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        h1 { color: #38bdf8; font-size: 20px; margin-bottom: 20px; }
+        input { width: 100%; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #334155; background: #0f172a; color: white; box-sizing: border-box; }
+        button { width: 100%; background: #22c55e; color: white; border: none; padding: 12px; border-radius: 4px; font-weight: bold; cursor: pointer; margin-top: 10px; }
+      </style>
+    </head>
+    <body>
+      <div class="form-card">
+        <h1>🏢 Vivy Agency Partnership Application</h1>
+        <form action="/api/register/agency" method="POST">
+          <input type="text" name="agencyName" placeholder="Agency Business Name" required>
+          <input type="text" name="ownerName" placeholder="Owner Full Name" required>
+          <input type="text" name="wallet" placeholder="USDT TRC-20 Payout Wallet Address" required>
+          <button type="submit">Submit Application</button>
+        </form>
+      </div>
+    </body>
+    </html>
+  `);
 });
 
 // ==========================================
-// 2. UNIFIED VISUAL CONTROL CENTER
+// 2. FORM PROCESSING ENGINES (POST ROUTES)
+// ==========================================
+app.post('/api/register/host', async (req, res) => {
+  const { username, email, inviteCode } = req.body;
+  if (!username || !email || !inviteCode) return res.status(400).send("Missing field fields.");
+  try {
+    const agency = await sql`SELECT id FROM agencies WHERE invite_code = ${inviteCode} AND is_approved = TRUE`;
+    if (!agency[0]) return res.status(400).send("<h3>Error: Invalid or unapproved agency code.</h3>");
+    const userResult = await sql`INSERT INTO users (username, email, role, is_approved) VALUES (${username}, ${email}, 'host', FALSE) RETURNING id`;
+    await sql`INSERT INTO host_profiles (host_id, agency_id, earned_coins_balance, is_agency_locked) VALUES (${userResult[0].id}, ${agency[0].id}, 0, TRUE)`;
+    return res.send("<h2>🎉 Success! Application submitted. Please tell your manager to approve you on the panel.</h2>");
+  } catch (err) { return res.status(500).send(err.message); }
+});
+
+app.post('/api/register/agency', async (req, res) => {
+  const { agencyName, ownerName, wallet } = req.body;
+  if (!agencyName || !ownerName || !wallet) return res.status(400).send("Missing fields.");
+  try {
+    await sql`
+      INSERT INTO agencies (agency_name, owner_name, commission_rate, usdt_wallet_address, wallet_balance_usd, is_approved) 
+      VALUES (${agencyName}, ${ownerName}, 0.10, ${wallet}, 0.00, FALSE)
+    `;
+    return res.send("<h2>🎉 Registration Received! Inform Vivy administration to activate your onboarding link.</h2>");
+  } catch (err) { return res.status(500).send(err.message); }
+});
+
+// ==========================================
+// 3. CENTRAL MASTER MANAGEMENT ECOSYSTEM (ADMIN)
 // ==========================================
 app.get('/admin', async (req, res) => {
   try {
@@ -169,7 +248,7 @@ app.get('/admin', async (req, res) => {
 });
 
 // ==========================================
-// 3. OPERATIONAL POST ACTION ENGINES
+// 4. ACTION CONTROLLERS (REDIRECT ENGINES)
 // ==========================================
 app.post('/admin/approve-agency', async (req, res) => {
   const { id, fallbackCode } = req.body;
