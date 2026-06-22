@@ -298,6 +298,11 @@ app.post('/admin/pay-agency', async (req, res) => {
     return res.redirect('/admin');
   } catch (err) { return res.status(500).send(err.message); }
 });
-
+app.get('/health', async (req, res) => {
+  try {
+    const result = await sql`SELECT NOW()`;
+    return res.json({ status: "Vivy Engine Active!", dbTime: result[0].now });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => { console.log(`Ecosystem online on ${PORT}`); });
