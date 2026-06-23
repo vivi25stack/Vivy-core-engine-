@@ -304,5 +304,78 @@ app.get('/health', async (req, res) => {
     return res.json({ status: "Vivy Engine Active!", dbTime: result[0].now });
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
+// ==========================================
+// 5. LIVE VIDEO CALLING & REAL-TIME BILLING ENGINE
+// ==========================================
+
+// Initialise Call: Verify user can afford the connection
+app.post('/api/calls/initiate', async (req, res) => {
+  const { callerId, hostId } = req.body;
+  if (!callerId || !hostId) return res.status(400).json({ error: "Missing identity profiles." });
+
+  try {
+    // Check if user has enough coins for the first 30 seconds (250 coins minimum)
+    const user = await sql`SELECT coin_balance FROM users WHERE id = ${callerId}`;
+    if (!user[0] || user[0].coin_balance < DEDUCTION_PER_30_SECONDS) {
+      return res.status(402).json({ error: "Insufficient coins to start a call." });
+    }
+
+    // Create an active call record session
+    const session = await sql`
+      INSERT INTO call_sessions (caller_id, host_id, status, total_deducted_coins)
+      VALUES (${callerId}, ${hostId}, 'active', 0) RETURNING id
+    `;
+
+    // In production, you would generate your Agora/ZEGOCLOUD token here.
+    return res.json({
+      message: "Call pre-approved.",
+      sessionId: session[0].id,
+      agoraChannel: `vivy_room_${session[0].id}`,
+      tokenPlaceholder: "VIVY_SECURE_RTC_STREAM_TOKEN_XYZ"
+    });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
+// 30-Second Heartbeat: Deduct coins continuously while call is active
+app.post('/api/calls/heartbeat', async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).json({ error: "Missing session tracking id." });
+
+  try {
+    // 1. Get session details
+    const session = await sql`SELECT caller_id, host_id, status FROM call_sessions WHERE id = ${sessionId}`;
+    if (!session[0] || session[0].status !== 'active') {
+      return res.json({ action: "TERMINATE_CALL", reason: "Session no longer active." });
+    }
+
+    const { caller_id, host_id } = session[0];
+
+    // 2. Check live coin balance
+    const user = await sql`SELECT coin_balance FROM users WHERE id = ${caller_id}`;
+    if (!user[0] || user[0].coin_balance < DEDUCTION_PER_30_SECONDS) {
+      // Force end call immediately if ran out of money
+      await sql`UPDATE call_sessions SET status = 'ended', ended_at = NOW() WHERE id = ${sessionId}`;
+      return res.json({ action: "TERMINATE_CALL", reason: "Insufficient balance." });
+    }
+
+    // 3. ATOMIC TRANSACTION: Deduct from caller, add to host, track total
+    await sql.transaction(async tx => {
+      await tx`UPDATE users SET coin_balance = coin_balance - ${DEDUCTION_PER_30_SECONDS} WHERE id = ${caller_id}`;
+      await tx`UPDATE host_profiles SET earned_coins_balance = earned_coins_balance + ${DEDUCTION_PER_30_SECONDS} WHERE host_id = ${host_id}`;
+      await tx`UPDATE call_sessions SET total_deducted_coins = total_deducted_coins + ${DEDUCTION_PER_30_SECONDS} WHERE id = ${sessionId}`;
+    });
+
+    return res.json({ action: "CONTINUE_CALL", currentSessionCoins: DEDUCTION_PER_30_SECONDS });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
+// Terminate Call: Clean up session when either party hangs up
+app.post('/api/calls/terminate', async (req, res) => {
+  const { sessionId } = req.body;
+  try {
+    await sql`UPDATE call_sessions SET status = 'ended', ended_at = NOW() WHERE id = ${sessionId}`;
+    return res.json({ message: "Call session closed cleanly." });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => { console.log(`Ecosystem online on ${PORT}`); });
