@@ -1,381 +1,203 @@
 require('dotenv').config();
-
 const express = require('express');
-const http = require('http');
-const { neon } = require('@neondatabase/serverless');
+const crypto = require('crypto');
+const { Pool } = require('pg');
 
 const app = express();
-app.use(express.json()); 
-app.use(express.urlencoded({ extended: true })); 
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-const sql = neon(process.env.DATABASE_URL);
-const server = http.createServer(app);
+// Paystack rates configuration constants
+const COIN_PRICE_USD = 0.02; // $0.02 per single coin ($10 = 500 coins)
 
-const HOST_MINIMUM_COINS = 10000; 
-const COIN_TO_USD_VALUE = 0.001;  
-const DEDUCTION_PER_30_SECONDS = 250; 
+// Express body parser json engine
+app.use(express.json());
 
-// ==========================================
-// 1. VISUAL SIGNUP SCREENS (GET ROUTES)
-// ==========================================
+// =========================================================================
+// 1. INITIALIZE TRANSACTION: Requesting token authorization from Backend
+// =========================================================================
+app.post('/api/payments/initialize', async (req, res) => {
+    const { userId, amountUsd } = req.body;
+    
+    try {
+        const userQuery = await pool.query('SELECT email FROM users WHERE id = $1', [userId]);
+        if (userQuery.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+        const userEmail = userQuery.rows[0].email;
 
-// Host Onboarding Form Layout
-app.get('/api/register/host', (req, res) => {
-  const inviteCode = req.query.code || '';
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Vivy Host Onboarding</title>
-      <style>
-        body { font-family: -apple-system, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; text-align: center; }
-        .form-card { background: #1e293b; padding: 20px; border-radius: 8px; max-width: 400px; margin: 40px auto; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-        h1 { color: #f472b6; font-size: 20px; margin-bottom: 20px; }
-        input { width: 100%; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #334155; background: #0f172a; color: white; box-sizing: border-box; }
-        button { width: 100%; background: #3b82f6; color: white; border: none; padding: 12px; border-radius: 4px; font-weight: bold; cursor: pointer; margin-top: 10px; }
-      </style>
-    </head>
-    <body>
-      <div class="form-card">
-        <h1>🎙️ Join Vivy Host Network</h1>
-        <form action="/api/register/host" method="POST">
-          <input type="text" name="username" placeholder="Choose Host Stage Name" required>
-          <input type="email" name="email" placeholder="Your Email Address" required>
-          <input type="text" name="inviteCode" placeholder="Agency Invitation Code" value="${inviteCode}" required>
-          <button type="submit">Submit Registration</button>
-        </form>
-      </div>
-    </body>
-    </html>
-  `);
+        const reference = `vivy_${crypto.randomBytes(8).toString('hex')}`;
+        const coinsToCredit = Math.floor(amountUsd / COIN_PRICE_USD);
+
+        // Record initial pending intent state inside database
+        await pool.query(
+            'INSERT INTO transactions (user_id, reference, amount_usd, coins_credited, status) VALUES ($1, $2, $3, $4, \'pending\')',
+            [userId, reference, amountUsd, coinsToCredit]
+        );
+
+        // Fetch initialization access_code directly via Paystack Engine
+        const response = await fetch('https://api.paystack.co/transaction/initialize', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                email: userEmail,
+                amount: Math.round(amountUsd * 100), // Convert to base cents
+                currency: 'USD',
+                reference: reference
+            })
+        });
+
+        const paystackData = await response.json();
+        if (!paystackData.status) return res.status(400).json({ error: paystackData.message });
+
+        // Pass authorization metadata down to your Flutter application layer
+        res.json({
+            accessCode: paystackData.data.access_code,
+            reference: reference
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
 });
 
-// Agency Onboarding Form Layout
-app.get('/api/register/agency', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Vivy Agency Registration</title>
-      <style>
-        body { font-family: -apple-system, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; text-align: center; }
-        .form-card { background: #1e293b; padding: 20px; border-radius: 8px; max-width: 400px; margin: 40px auto; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-        h1 { color: #38bdf8; font-size: 20px; margin-bottom: 20px; }
-        input { width: 100%; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #334155; background: #0f172a; color: white; box-sizing: border-box; }
-        button { width: 100%; background: #22c55e; color: white; border: none; padding: 12px; border-radius: 4px; font-weight: bold; cursor: pointer; margin-top: 10px; }
-      </style>
-    </head>
-    <body>
-      <div class="form-card">
-        <h1>🏢 Vivy Agency Partnership Application</h1>
-        <form action="/api/register/agency" method="POST">
-          <input type="text" name="agencyName" placeholder="Agency Business Name" required>
-          <input type="text" name="ownerName" placeholder="Owner Full Name" required>
-          <input type="text" name="wallet" placeholder="USDT TRC-20 Payout Wallet Address" required>
-          <button type="submit">Submit Application</button>
-        </form>
-      </div>
-    </body>
-    </html>
-  `);
-});
+// =========================================================================
+// 2. CRYPTOGRAPHIC WEBHOOK ROUTE: Delivers coins asynchronously 
+// =========================================================================
+app.post('/api/payments/paystack-webhook', async (req, res) => {
+    const signature = req.headers['x-paystack-signature'];
+    
+    // Compute HMAC hash using local secret key signature validation loop
+    const hash = crypto
+        .createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
+        .update(JSON.stringify(req.body))
+        .digest('hex');
 
-// ==========================================
-// 2. FORM PROCESSING ENGINES (POST ROUTES)
-// ==========================================
-app.post('/api/register/host', async (req, res) => {
-  const { username, email, inviteCode } = req.body;
-  if (!username || !email || !inviteCode) return res.status(400).send("Missing field fields.");
-  try {
-    const agency = await sql`SELECT id FROM agencies WHERE invite_code = ${inviteCode} AND is_approved = TRUE`;
-    if (!agency[0]) return res.status(400).send("<h3>Error: Invalid or unapproved agency code.</h3>");
-    const userResult = await sql`INSERT INTO users (username, email, role, is_approved) VALUES (${username}, ${email}, 'host', FALSE) RETURNING id`;
-    await sql`INSERT INTO host_profiles (host_id, agency_id, earned_coins_balance, is_agency_locked) VALUES (${userResult[0].id}, ${agency[0].id}, 0, TRUE)`;
-    return res.send("<h2>🎉 Success! Application submitted. Please tell your manager to approve you on the panel.</h2>");
-  } catch (err) { return res.status(500).send(err.message); }
-});
-
-app.post('/api/register/agency', async (req, res) => {
-  const { agencyName, ownerName, wallet } = req.body;
-  if (!agencyName || !ownerName || !wallet) return res.status(400).send("Missing fields.");
-  try {
-    await sql`
-      INSERT INTO agencies (agency_name, owner_name, commission_rate, usdt_wallet_address, wallet_balance_usd, is_approved) 
-      VALUES (${agencyName}, ${ownerName}, 0.10, ${wallet}, 0.00, FALSE)
-    `;
-    return res.send("<h2>🎉 Registration Received! Inform Vivy administration to activate your onboarding link.</h2>");
-  } catch (err) { return res.status(500).send(err.message); }
-});
-
-// ==========================================
-// 3. CENTRAL MASTER MANAGEMENT ECOSYSTEM (ADMIN)
-// ==========================================
-app.get('/admin', async (req, res) => {
-  try {
-    const agencies = await sql`SELECT id, agency_name, owner_name, commission_rate, wallet_balance_usd, usdt_wallet_address, invite_code, is_approved FROM agencies ORDER BY id DESC`;
-    const hostProfiles = await sql`
-      SELECT hp.host_id, u.username, hp.earned_coins_balance, a.agency_name, hp.is_agency_locked, u.is_approved
-      FROM host_profiles hp
-      JOIN users u ON hp.host_id = u.id
-      LEFT JOIN agencies a ON hp.agency_id = a.id
-      ORDER BY u.id DESC
-    `;
-    const payrollLogs = await sql`
-      SELECT p.id, a.agency_name, p.amount_paid_usd, p.payment_date 
-      FROM agency_payroll p 
-      JOIN agencies a ON p.agency_id = a.id 
-      ORDER BY p.payment_date DESC
-    `;
-
-    let html = `
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Vivy Master Ecosystem</title>
-      <style>
-        body { font-family: -apple-system, sans-serif; background: #0f172a; color: #f8fafc; padding: 12px; margin: 0; }
-        h1 { color: #38bdf8; font-size: 20px; text-align: center; margin-bottom: 15px; }
-        .card { background: #1e293b; padding: 12px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.2); }
-        h2 { font-size: 14px; margin-top: 0; color: #f472b6; border-bottom: 1px solid #334155; padding-bottom: 5px; }
-        table { width: 100%; border-collapse: collapse; font-size: 11px; }
-        th, td { text-align: left; padding: 6px; border-bottom: 1px solid #334155; vertical-align: top; }
-        th { color: #94a3b8; }
-        .actions-cell { display: flex; flex-direction: column; gap: 4px; }
-        .btn { border: none; padding: 4px 6px; border-radius: 4px; font-weight: bold; font-size: 9px; cursor: pointer; text-align: center; color: white; display: block; width: 100%; box-sizing: border-box; }
-        .btn-approve { background: #eab308; color: #0f172a; }
-        .btn-reject { background: #ef4444; }
-        .btn-pay { background: #22c55e; }
-        .btn-lock { background: #3b82f6; }
-        .btn-disabled { background: #475569 !important; color: #94a3b8; cursor: not-allowed; }
-        .badge { display: inline-block; padding: 2px 4px; border-radius: 4px; font-size: 9px; font-weight: bold; }
-        .badge-active { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
-        .badge-pending { background: rgba(234, 179, 8, 0.2); color: #eab308; }
-        code { background: #0f172a; padding: 2px 4px; border-radius: 4px; color: #38bdf8; font-size: 10px; word-break: break-all; }
-      </style>
-    </head>
-    <body>
-      <h1>📱 Vivy Master Command Center</h1>
-
-      <div class="card">
-        <h2>🏢 Agency Registration & Finance Hub</h2>
-        <table>
-          <tr><th>Agency Profile</th><th>Wallet Address</th><th>Status</th><th>Available Actions</th></tr>
-    `;
-
-    agencies.forEach(a => {
-      const generatedCode = a.invite_code || `VIVY-${a.id}99`;
-      html += `
-        <tr>
-          <td><b>${a.agency_name}</b><br><span style="color:#94a3b8;font-size:9px;">Code: <code>${generatedCode}</code></span><br><span style="color:#22c55e;">$${parseFloat(a.wallet_balance_usd || 0).toFixed(2)}</span></td>
-          <td><code>${a.usdt_wallet_address || 'Unconfigured'}</code></td>
-          <td><span class="badge ${a.is_approved ? 'badge-active' : 'badge-pending'}">${a.is_approved ? 'Active' : 'Pending'}</span></td>
-          <td class="actions-cell">
-            <form action="/admin/approve-agency" method="POST" style="margin:0;">
-              <input type="hidden" name="id" value="${a.id}">
-              <input type="hidden" name="fallbackCode" value="${generatedCode}">
-              <button type="submit" class="btn btn-approve" ${a.is_approved ? 'disabled class="btn btn-disabled"' : ''}>Approve Agency</button>
-            </form>
-            <form action="/admin/reject-agency" method="POST" style="margin:0;">
-              <input type="hidden" name="id" value="${a.id}">
-              <button type="submit" class="btn btn-reject">Reject / Delete</button>
-            </form>
-            <form action="/admin/pay-agency" method="POST" style="margin:0;">
-              <input type="hidden" name="agencyId" value="${a.id}">
-              <input type="hidden" name="amount" value="${a.wallet_balance_usd}">
-              <button type="submit" class="btn btn-pay" ${a.wallet_balance_usd > 0 ? '' : 'disabled class="btn btn-disabled"'}>Payout USDT</button>
-            </form>
-          </td>
-        </tr>
-      `;
-    });
-
-    html += `
-        </table>
-      </div>
-
-      <div class="card">
-        <h2>👩‍🎤 Host Status & Anti-Hopping Verification</h2>
-        <table>
-          <tr><th>Host Profile</th><th>Belongs To</th><th>Status</th><th>Available Actions</th></tr>
-    `;
-
-    hostProfiles.forEach(h => {
-      html += `
-        <tr>
-          <td><b>${h.username}</b><br><span style="color:#eab308;font-size:9px;">🪙 ${h.earned_coins_balance}</span></td>
-          <td>${h.agency_name || 'Independent'}</td>
-          <td>
-            <span class="badge ${h.is_approved ? 'badge-active' : 'badge-pending'}">${h.is_approved ? 'Approved' : 'Pending'}</span><br>
-            <span style="font-size:9px; color:#94a3b8;">${h.is_agency_locked ? '🔒 Locked' : '🔓 Unlocked'}</span>
-          </td>
-          <td class="actions-cell">
-            <form action="/admin/approve-host" method="POST" style="margin:0;">
-              <input type="hidden" name="id" value="${h.host_id}">
-              <button type="submit" class="btn btn-approve" ${h.is_approved ? 'disabled class="btn btn-disabled"' : ''}>Approve Host</button>
-            </form>
-            <form action="/admin/reject-host" method="POST" style="margin:0;">
-              <input type="hidden" name="id" value="${h.host_id}">
-              <button type="submit" class="btn btn-reject">Reject Host</button>
-            </form>
-            <form action="/admin/toggle-host-lock" method="POST" style="margin:0;">
-              <input type="hidden" name="id" value="${h.host_id}">
-              <input type="hidden" name="currentLock" value="${h.is_agency_locked}">
-              <button type="submit" class="btn btn-lock">${h.is_agency_locked ? 'Break Lock' : 'Clamp Lock'}</button>
-            </form>
-          </td>
-        </tr>
-      `;
-    });
-
-    html += `
-        </table>
-      </div>
-
-      <div class="card">
-        <h2>📜 Historical Financial Payout History</h2>
-        <table>
-          <tr><th>Disbursed To</th><th>Amount Cleared</th><th>Date Settled</th></tr>
-    `;
-    payrollLogs.forEach(p => {
-      html += `<tr><td><b>${p.agency_name}</b></td><td style="color:#38bdf8; font-weight:bold;">$${p.amount_paid_usd}.00</td><td>${new Date(p.payment_date).toLocaleDateString()}</td></tr>`;
-    });
-    html += `</table></div></body></html>`;
-    return res.send(html);
-  } catch (err) { return res.status(500).send(`Dashboard View Failure: ${err.message}`); }
-});
-
-// ==========================================
-// 4. ACTION CONTROLLERS (REDIRECT ENGINES)
-// ==========================================
-app.post('/admin/approve-agency', async (req, res) => {
-  const { id, fallbackCode } = req.body;
-  try {
-    await sql`UPDATE agencies SET is_approved = TRUE, invite_code = ${fallbackCode} WHERE id = ${id}`;
-    return res.redirect('/admin');
-  } catch (err) { return res.status(500).send(err.message); }
-});
-
-app.post('/admin/reject-agency', async (req, res) => {
-  try {
-    await sql`DELETE FROM agencies WHERE id = ${req.body.id}`;
-    return res.redirect('/admin');
-  } catch (err) { return res.status(500).send(err.message); }
-});
-
-app.post('/admin/approve-host', async (req, res) => {
-  try {
-    await sql`UPDATE users SET is_approved = TRUE WHERE id = ${req.body.id}`;
-    return res.redirect('/admin');
-  } catch (err) { return res.status(500).send(err.message); }
-});
-
-app.post('/admin/reject-host', async (req, res) => {
-  try {
-    await sql`DELETE FROM users WHERE id = ${req.body.id}`;
-    return res.redirect('/admin');
-  } catch (err) { return res.status(500).send(err.message); }
-});
-
-app.post('/admin/toggle-host-lock', async (req, res) => {
-  const { id, currentLock } = req.body;
-  const targetLockState = !(currentLock === 'true' || currentLock === true);
-  try {
-    await sql`UPDATE host_profiles SET is_agency_locked = ${targetLockState} WHERE host_id = ${id}`;
-    return res.redirect('/admin');
-  } catch (err) { return res.status(500).send(err.message); }
-});
-
-app.post('/admin/pay-agency', async (req, res) => {
-  const { agencyId, amount } = req.body;
-  try {
-    const payoutAmount = Math.floor(parseFloat(amount || 0));
-    if (payoutAmount <= 0) return res.redirect('/admin');
-    await sql`UPDATE agencies SET wallet_balance_usd = wallet_balance_usd - ${payoutAmount} WHERE id = ${agencyId}`;
-    await sql`INSERT INTO agency_payroll (agency_id, amount_paid_usd) VALUES (${agencyId}, ${payoutAmount})`;
-    return res.redirect('/admin');
-  } catch (err) { return res.status(500).send(err.message); }
-});
-app.get('/health', async (req, res) => {
-  try {
-    const result = await sql`SELECT NOW()`;
-    return res.json({ status: "Vivy Engine Active!", dbTime: result[0].now });
-  } catch (err) { return res.status(500).json({ error: err.message }); }
-});
-// ==========================================
-// 5. LIVE VIDEO CALLING & REAL-TIME BILLING ENGINE
-// ==========================================
-
-// Initialise Call: Verify user can afford the connection
-app.post('/api/calls/initiate', async (req, res) => {
-  const { callerId, hostId } = req.body;
-  if (!callerId || !hostId) return res.status(400).json({ error: "Missing identity profiles." });
-
-  try {
-    // Check if user has enough coins for the first 30 seconds (250 coins minimum)
-    const user = await sql`SELECT coin_balance FROM users WHERE id = ${callerId}`;
-    if (!user[0] || user[0].coin_balance < DEDUCTION_PER_30_SECONDS) {
-      return res.status(402).json({ error: "Insufficient coins to start a call." });
+    if (hash !== signature) {
+        return res.status(401).send('Invalid Signature context.');
     }
 
-    // Create an active call record session
-    const session = await sql`
-      INSERT INTO call_sessions (caller_id, host_id, status, total_deducted_coins)
-      VALUES (${callerId}, ${hostId}, 'active', 0) RETURNING id
-    `;
+    const event = req.body;
+    if (event.event === 'charge.success') {
+        const { reference, amount } = event.data;
+        
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
 
-    // In production, you would generate your Agora/ZEGOCLOUD token here.
-    return res.json({
-      message: "Call pre-approved.",
-      sessionId: session[0].id,
-      agoraChannel: `vivy_room_${session[0].id}`,
-      tokenPlaceholder: "VIVY_SECURE_RTC_STREAM_TOKEN_XYZ"
-    });
-  } catch (err) { return res.status(500).json({ error: err.message }); }
-});
+            const txCheck = await client.query('SELECT * FROM transactions WHERE reference = $1', [reference]);
+            if (txCheck.rows.length === 0) throw new Error('Transaction record mismatch');
+            
+            const transaction = txCheck.rows[0];
 
-// 30-Second Heartbeat: Deduct coins continuously while call is active
-app.post('/api/calls/heartbeat', async (req, res) => {
-  const { sessionId } = req.body;
-  if (!sessionId) return res.status(400).json({ error: "Missing session tracking id." });
+            if (transaction.status === 'pending') {
+                // Safely update specific transaction context state
+                await client.query('UPDATE transactions SET status = \'successful\' WHERE reference = $1', [reference]);
 
-  try {
-    // 1. Get session details
-    const session = await sql`SELECT caller_id, host_id, status FROM call_sessions WHERE id = ${sessionId}`;
-    if (!session[0] || session[0].status !== 'active') {
-      return res.json({ action: "TERMINATE_CALL", reason: "Session no longer active." });
+                // Increment verified coin assets inside client profile balance ledger
+                await client.query(
+                    'UPDATE users SET coin_balance = coin_balance + $1 WHERE id = $2',
+                    [transaction.coins_credited, transaction.user_id]
+                );
+                
+                await client.query('COMMIT');
+                console.log(`Successfully credited ${transaction.coins_credited} coins to User: ${transaction.user_id}`);
+            } else {
+                await client.query('ROLLBACK');
+            }
+        } catch (error) {
+            await client.query('ROLLBACK');
+            console.error('Webhook execution failure runtime exception:', error);
+        } finally {
+            client.release();
+        }
     }
+    // Always return 200 OK to stop Paystack from resending the hook
+    res.status(200).send('Event captured.');
+});
 
-    const { caller_id, host_id } = session[0];
+// =========================================================================
+// 3. STREAM HEARTBEAT LOOP: 30-Second dynamic deduction engine
+// =========================================================================
+app.post('/api/stream/heartbeat', async (req, res) => {
+    const { userId, hostId, roomId, costPerHeartbeat } = req.body;
 
-    // 2. Check live coin balance
-    const user = await sql`SELECT coin_balance FROM users WHERE id = ${caller_id}`;
-    if (!user[0] || user[0].coin_balance < DEDUCTION_PER_30_SECONDS) {
-      // Force end call immediately if ran out of money
-      await sql`UPDATE call_sessions SET status = 'ended', ended_at = NOW() WHERE id = ${sessionId}`;
-      return res.json({ action: "TERMINATE_CALL", reason: "Insufficient balance." });
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Verify user balances can sustain next billing cycle requirement
+        const userQuery = await client.query('SELECT coin_balance FROM users WHERE id = $1 FOR UPDATE', [userId]);
+        if (userQuery.rows.length === 0) throw new Error('User missing');
+        
+        const currentBalance = userQuery.rows[0].coin_balance;
+
+        if (currentBalance < costPerHeartbeat) {
+            await client.query('COMMIT');
+            // Notify frontend to fire ZEGOCLOUD disconnect signal execution payload
+            return res.json({ status: 'disconnect', reason: 'Insufficient balance' });
+        }
+
+        // Deduct coin assets from dynamic user record loop
+        await client.query('UPDATE users SET coin_balance = coin_balance - $1 WHERE id = $2', [costPerHeartbeat, userId]);
+
+        // Log session balance modification event trace tracking data
+        await client.query(
+            'INSERT INTO billing_sessions (user_id, host_id, zegocloud_room_id, total_coins_burned) ' +
+            'VALUES ($1, $2, $3, $4) ON CONFLICT DO UPDATE SET total_coins_burned = billing_sessions.total_coins_burned + $4',
+            [userId, hostId, roomId, costPerHeartbeat]
+        );
+
+        await client.query('COMMIT');
+        res.json({ status: 'active', remainingBalance: currentBalance - costPerHeartbeat });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
     }
-
-    // 3. ATOMIC TRANSACTION: Deduct from caller, add to host, track total
-    await sql.transaction(async tx => {
-      await tx`UPDATE users SET coin_balance = coin_balance - ${DEDUCTION_PER_30_SECONDS} WHERE id = ${caller_id}`;
-      await tx`UPDATE host_profiles SET earned_coins_balance = earned_coins_balance + ${DEDUCTION_PER_30_SECONDS} WHERE host_id = ${host_id}`;
-      await tx`UPDATE call_sessions SET total_deducted_coins = total_deducted_coins + ${DEDUCTION_PER_30_SECONDS} WHERE id = ${sessionId}`;
-    });
-
-    return res.json({ action: "CONTINUE_CALL", currentSessionCoins: DEDUCTION_PER_30_SECONDS });
-  } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
-// Terminate Call: Clean up session when either party hangs up
-app.post('/api/calls/terminate', async (req, res) => {
-  const { sessionId } = req.body;
-  try {
-    await sql`UPDATE call_sessions SET status = 'ended', ended_at = NOW() WHERE id = ${sessionId}`;
-    return res.json({ message: "Call session closed cleanly." });
-  } catch (err) { return res.status(500).json({ error: err.message }); }
+// =========================================================================
+// 4. SUNDAY 5:00 PM SETTLEMENT AUTOMATION RUNTIME SCRIPT
+// =========================================================================
+app.post('/api/admin/trigger-weekly-settlement', async (req, res) => {
+    const USDT_CONVERSION_RATE = 0.02; // Every coin earned maps to fractional USD revenue values
+    
+    try {
+        // Query groups aggregate system coin balances across host and agency parameters
+        const settlementQuery = await pool.query(`
+            SELECT h.agency_id, SUM(bs.total_coins_burned) as total_earned
+            FROM billing_sessions bs
+            JOIN hosts h ON bs.host_id = h.id
+            WHERE bs.is_active = true
+            GROUP BY h.agency_id
+        `);
+
+        for (let row of settlementQuery.rows) {
+            if (!row.agency_id) continue;
+            
+            const grossCoins = parseInt(row.total_earned);
+            const totalUsdtPool = grossCoins * USDT_CONVERSION_RATE;
+            
+            // Execute exact application revenue allocations: 70% Host / 10% Agency commission structures
+            const hostShareUsdt = totalUsdtPool * 0.70;
+            const agencyShareUsdt = totalUsdtPool * 0.10;
+
+            await pool.query(
+                'INSERT INTO weekly_payout_batches (agency_id, gross_coins_earned, agency_share_usdt, host_share_usdt, batch_cutoff_date) ' +
+                'VALUES ($1, $2, $3, $4, NOW())',
+                [row.agency_id, grossCoins, agencyShareUsdt, hostShareUsdt]
+            );
+        }
+
+        // Freeze calculated historical data segments to finalize accounting bounds
+        await pool.query('UPDATE billing_sessions SET is_active = false WHERE is_active = true');
+
+        res.json({ status: 'success', message: 'Sunday settlement ledger locked down successfully.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
-const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => { console.log(`Ecosystem online on ${PORT}`); });
+
+app.listen(3000, () => console.log('Vivy Server running on engine port 3000'));
