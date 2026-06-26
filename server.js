@@ -7,93 +7,82 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 1. Safe Neon Database Connection Setup
-const dbUrl = process.env.DATABASE_URL;
-if (!dbUrl) {
-  console.error("❌ CRITICAL ERROR: DATABASE_URL environment variable is missing!");
-  console.log("👉 Make sure to add DATABASE_URL to your Render or local environment variables.");
-}
-
 const pool = new Pool({
-  connectionString: dbUrl,
-  ssl: { rejectUnauthorized: false } // Required securely for Neon connections
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-// Test DB Connection on boot without throwing uncaught exceptions
-pool.connect((err, client, release) => {
-  if (err) {
-    console.error('❌ Database connection failed:', err.message);
-  } else {
-    console.log('✅ Connected to Neon PostgreSQL successfully.');
-    release();
-  }
-});
-
-// 2. Base Route (To prove your server is alive)
+// Base Route
 app.get('/', (req, res) => {
-  res.status(200).json({ status: "online", message: "Vivy backend is running smoothly!" });
+  res.json({ status: "online", platform: "Vivy Core Engine" });
 });
 
-// 3. Google Play Purchase Ingestion (Coin Purchases)
-app.post('/api/payments/google-play', async (req, res) => {
-  const { userId, coinAmount, purchaseToken } = req.body;
-
+// Update Presence & Profile Avatar
+app.post('/api/user/update-profile', async (req, res) => {
+  const { userId, avatarUrl, isOnline, isStreaming, agencyCode } = req.body;
   try {
-    // ⚠️ Real setup requires validating purchaseToken via googleapis
-    // For now, securely process the verified package asset lifecycle
-    await pool.query('BEGIN');
-    
-    // Credit user coins
     await pool.query(
-      'UPDATE users SET coins = coins + $1 WHERE id = $2',
-      [coinAmount, userId]
+      `UPDATE users 
+       SET avatar_url = COALESCE($1, avatar_url), 
+           is_online = COALESCE($2, is_online), 
+           is_streaming = COALESCE($3, is_streaming),
+           agency_code = COALESCE($4, agency_code)
+       WHERE id = $5`,
+      [avatarUrl, isOnline, isStreaming, agencyCode, userId]
     );
-
-    // Log the event history log
-    await pool.query(
-      'INSERT INTO coin_transactions (user_id, amount_coins, payment_method, status) VALUES ($1, $2, $3, $4)',
-      [userId, coinAmount, 'google_play', 'completed']
-    );
-
-    await pool.query('COMMIT');
-    res.status(200).json({ success: true, message: `${coinAmount} coins successfully credited.` });
-  } catch (error) {
-    await pool.query('ROLLBACK');
-    console.error('Error processing Google Play asset:', error);
-    res.status(500).json({ success: false, error: 'Database processing failed.' });
+    res.json({ success: true, message: "Profile tracking properties modified successfully." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// 4. Paystack Integration Placeholder (Safe & Documented)
-// Keeps server working seamlessly while your approval goes through
-app.post('/api/payments/paystack-init', (req, res) => {
-  res.status(202).json({
-    success: false,
-    message: "Paystack route is prepared. Gateway will be active following agency/host profile verification approval.",
-    status: "pending_activation"
-  });
-});
-
-// 5. App Dashboard Metrics Fetch API
-app.get('/api/dashboard/user/:id', async (req, res) => {
+// Get Active Hosts Registry for Selection Grid
+app.get('/api/hosts/active', async (req, res) => {
   try {
-    const userQuery = await pool.query('SELECT id, username, email, role, coins FROM users WHERE id = $1', [req.params.id]);
-    if (userQuery.rows.length === 0) {
-      return res.status(404).json({ error: "User profile record not found." });
-    }
-    res.status(200).json(userQuery.rows[0]);
-  } catch (error) {
-    res.status(500).json({ error: "Internal server error reading dashboard data." });
+    const activeHosts = await pool.query(
+      `SELECT id, username, avatar_url, is_streaming, coins 
+       FROM users 
+       WHERE role = 'host' AND is_online = true`
+    );
+    res.json(activeHosts.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Global Error Catch to prevent server drops on rogue client requests
-app.use((err, req, res, next) => {
-  console.error("Unhandled runtime error:", err.stack);
-  res.status(500).json({ error: "Something went wrong inside the server engine." });
+// Agency Dashboard: Managed Hosts Tracking Matrix
+app.get('/api/agency/:code/hosts', async (req, res) => {
+  try {
+    const managedHosts = await pool.query(
+      `SELECT id, username, avatar_url, is_online, is_streaming, coins as total_earned_coins
+       FROM users 
+       WHERE agency_code = $1 AND role = 'host'`,
+      [req.params.code]
+    );
+    res.json({
+      agencyCode: req.params.code,
+      totalHostsCount: managedHosts.rowCount,
+      hosts: managedHosts.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// RTC Signaling Stream Handshake Room Initializer
+app.post('/api/calls/initiate', async (req, res) => {
+  const { hostId, callerId } = req.body;
+  const generatedRoomId = `room_${hostId}_${Date.now()}`;
+  try {
+    await pool.query(
+      'INSERT INTO active_calls (host_id, caller_id, room_id, status) VALUES ($1, $2, $3, $4)',
+      [hostId, callerId, generatedRoomId, 'connecting']
+    );
+    res.json({ success: true, roomId: generatedRoomId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server actively listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Vivy Server Engine Active On Port ${PORT}`));
