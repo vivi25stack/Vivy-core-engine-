@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto'); // Built-in Node module for signature checking
 const { Pool } = require('pg');
 
 const app = express();
@@ -17,39 +18,69 @@ app.get('/', (req, res) => {
   res.json({ status: "online", platform: "Vivy Core Engine" });
 });
 
-// 🟢 NEW: Paystack Webhook Handler (Makes the URL Valid for Paystack!)
+// 🟢 SECURED: Paystack Webhook Handler
 app.post('/api/payments/paystack-webhook', async (req, res) => {
-  // Paystack pings this to test if the URL works
-  const event = req.body;
-  
-  console.log("Paystack Webhook received event:", event.event);
+  try {
+    // 1. Verify the Paystack Signature to ensure it actually came from Paystack
+    const hash = crypto
+      .createHmac('sha512', process.env.PAYSTACK_SECRET_KEY) // Ensure this is in your .env file
+      .update(JSON.stringify(req.body))
+      .digest('hex');
 
-  // If it's a successful payment event, process it
-  if (event.event === 'charge.success') {
-    const { metadata, amount } = event.data;
-    // metadata will contain the userId passed during checkout
-    const userId = metadata ? metadata.user_id : null;
-    
-    if (userId) {
-      try {
-        const coinAmount = Math.floor(amount / 100); // Convert Kobo to Coins/Naira equivalent
-        
-        await pool.query('BEGIN');
-        await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [coinAmount, userId]);
-        await pool.query(
-          'INSERT INTO coin_transactions (user_id, amount_coins, payment_method, status) VALUES ($1, $2, $3, $4)',
-          [userId, coinAmount, 'paystack', 'completed']
-        );
-        await pool.query('COMMIT');
-        console.log(`Successfully credited ${coinAmount} coins to user ${userId}`);
-      } catch (dbErr) {
-        await pool.query('ROLLBACK');
-        console.error('Database webhook update failed:', dbErr);
-      }
+    if (hash !== req.headers['x-paystack-signature']) {
+      console.error("❌ UN-AUTHORIZED WEBHOOK ATTEMPT DETECTED!");
+      return res.sendStatus(401); // Reject bad requests immediately
     }
+
+    const event = req.body;
+    console.log("🔒 Verified Paystack Event:", event.event);
+
+    // 2. Only handle successful payments
+    if (event.event === 'charge.success') {
+      const { metadata, amount, reference } = event.data;
+      const userId = metadata ? metadata.user_id : null;
+      
+      if (!userId) {
+        console.error("❌ Webhook received but no user_id found in metadata.");
+        return res.sendStatus(200);
+      }
+
+      await pool.query('BEGIN');
+
+      // 3. Prevent duplicate crediting (Idempotency Check)
+      // Checks if this Paystack reference code was already processed
+      const duplicateCheck = await pool.query(
+        'SELECT id FROM coin_transactions WHERE reference = $1', 
+        [reference]
+      );
+
+      if (duplicateCheck.rowCount > 0) {
+        console.log(`⚠️ Transaction ${reference} already processed. Skipping.`);
+        await pool.query('COMMIT');
+        return res.sendStatus(200);
+      }
+
+      // 4. Convert Kobo to Coins safely
+      const coinAmount = Math.floor(amount / 100); 
+
+      // 5. Securely credit coins and record the transaction ledger
+      await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [coinAmount, userId]);
+      await pool.query(
+        'INSERT INTO coin_transactions (user_id, amount_coins, payment_method, status, reference) VALUES ($1, $2, $3, $4, $5)',
+        [userId, coinAmount, 'paystack', 'completed', reference]
+      );
+
+      await pool.query('COMMIT');
+      console.log(`✅ Real Cash Confirmed. Credited ${coinAmount} coins to user ${userId}`);
+    }
+
+  } catch (dbErr) {
+    if (pool) await pool.query('ROLLBACK');
+    console.error('Database webhook update failed:', dbErr);
+    return res.sendStatus(500); // Let paystack know to try again later because server errored out
   }
 
-  // ALWAYS respond with a 200 OK so Paystack knows the server is alive!
+  // Always return 200 OK to verified Paystack triggers
   res.sendStatus(200);
 });
 
